@@ -79,6 +79,11 @@ type RangeController interface {
 	//
 	// Requires replica.raftMu to be held.
 	MaybeSendPingsRaftMuLocked()
+	// HoldsSendTokensRaftMuLocked returns true if the replica holds any send
+	// tokens. Used to prevent replica quiescence.
+	//
+	// Requires replica.raftMu to be held.
+	HoldsSendTokensRaftMuLocked() bool
 	// SetReplicasRaftMuLocked sets the replicas of the range. The caller will
 	// never mutate replicas, and neither should the callee.
 	//
@@ -561,6 +566,7 @@ type rangeController struct {
 		// to call into the replicaSendStreams that have asked to be scheduled.
 		replicas map[roachpb.ReplicaID]struct{}
 	}
+	entryFCStateScratch []entryFCState
 }
 
 // voterStateForWaiters informs whether WaitForEval is required to wait for
@@ -610,7 +616,7 @@ func NewRangeController(
 	rc.scheduledMu.replicas = make(map[roachpb.ReplicaID]struct{})
 	rc.mu.waiterSetRefreshCh = make(chan struct{})
 	rc.mu.lastSendQueueStats = make(RangeSendQueueStats, 0, len(init.ReplicaSet))
-	rc.updateReplicaSet(ctx, init.ReplicaSet)
+	rc.updateReplicaSetRaftMuLocked(ctx, init.ReplicaSet)
 	rc.updateWaiterSetsRaftMuLocked()
 	rc.opts.RangeControllerMetrics.Count.Inc(1)
 	return rc
@@ -630,7 +636,8 @@ func (rc *rangeController) WaitForEval(
 	if wc == admissionpb.ElasticWorkClass {
 		waitForAllReplicateHandles = true
 	}
-	var handles []tokenWaitingHandleInfo
+	var handlesScratch [5]tokenWaitingHandleInfo
+	handles := handlesScratch[:]
 	var scratch []reflect.SelectCase
 
 	rc.opts.EvalWaitMetrics.OnWaiting(wc)
@@ -933,7 +940,11 @@ func constructRaftEventForReplica(
 func (rc *rangeController) HandleRaftEventRaftMuLocked(ctx context.Context, e RaftEvent) error {
 	// Compute the flow control state for each new entry. We do this once
 	// here, instead of decoding each entry multiple times for all replicas.
-	newEntries := make([]entryFCState, len(e.Entries))
+	numEntries := len(e.Entries)
+	if cap(rc.entryFCStateScratch) < numEntries {
+		rc.entryFCStateScratch = make([]entryFCState, 0, 2*numEntries)
+	}
+	newEntries := rc.entryFCStateScratch[:numEntries:numEntries]
 	// needsTokens tracks which classes need tokens for the new entries. This
 	// informs first-pass decision-making on replicas that don't have
 	// send-queues, in MsgAppPull mode, and therefore can potentially send the
@@ -1298,10 +1309,23 @@ func (rc *rangeController) MaybeSendPingsRaftMuLocked() {
 		if id == rc.opts.LocalReplicaID {
 			continue
 		}
-		if s := state.sendStream; s != nil && s.shouldPing() {
+		if s := state.sendStream; s != nil && s.holdsTokens() {
 			rc.opts.RaftInterface.SendPingRaftMuLocked(id)
 		}
 	}
+}
+
+// HoldsSendTokensRaftMuLocked implements RangeController.
+func (rc *rangeController) HoldsSendTokensRaftMuLocked() bool {
+	// TODO(pav-kv): we are doing the same checks in MaybeSendPingsRaftMuLocked
+	// here, and both are called from Replica.tick. We can optimize this, and do
+	// both in one method.
+	for _, state := range rc.replicaMap {
+		if s := state.sendStream; s != nil && s.holdsTokens() {
+			return true
+		}
+	}
+	return false
 }
 
 // SetReplicasRaftMuLocked sets the replicas of the range. The caller will
@@ -1309,7 +1333,7 @@ func (rc *rangeController) MaybeSendPingsRaftMuLocked() {
 //
 // Requires replica.raftMu to be held.
 func (rc *rangeController) SetReplicasRaftMuLocked(ctx context.Context, replicas ReplicaSet) error {
-	rc.updateReplicaSet(ctx, replicas)
+	rc.updateReplicaSetRaftMuLocked(ctx, replicas)
 	rc.updateWaiterSetsRaftMuLocked()
 	return nil
 }
@@ -1457,7 +1481,10 @@ func (rc *rangeController) updateSendQueueStatsRaftMuRCLocked(now time.Time) {
 	rc.mu.lastSendQueueStatRefresh = now
 }
 
-func (rc *rangeController) updateReplicaSet(ctx context.Context, newSet ReplicaSet) {
+func (rc *rangeController) updateReplicaSetRaftMuLocked(ctx context.Context, newSet ReplicaSet) {
+	var toAdd, toRemove [5]roachpb.ReplicaID
+	add := toAdd[:0:len(toAdd)]
+	remove := toRemove[:0:len(toRemove)]
 	prevSet := rc.replicaSet
 	for r := range prevSet {
 		desc, ok := newSet[r]
@@ -1468,7 +1495,7 @@ func (rc *rangeController) updateReplicaSet(ctx context.Context, newSet ReplicaS
 				rs.closeSendStream(ctx)
 			}
 			delete(rc.replicaMap, r)
-			rc.mu.lastSendQueueStats.Remove(r)
+			remove = append(remove, r)
 		} else {
 			rs := rc.replicaMap[r]
 			rs.desc = desc
@@ -1482,6 +1509,17 @@ func (rc *rangeController) updateReplicaSet(ctx context.Context, newSet ReplicaS
 		}
 		newRepl := NewReplicaState(ctx, rc, desc)
 		rc.replicaMap[r] = newRepl
+		add = append(add, r)
+	}
+	rc.replicaSet = newSet
+
+	// Acquire rc.mu since we need to update rc.mu.lastSendQueueStats.
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	for _, r := range remove {
+		rc.mu.lastSendQueueStats.Remove(r)
+	}
+	for _, r := range add {
 		rc.mu.lastSendQueueStats.Set(ReplicaSendQueueStats{
 			ReplicaID: r,
 			// NOTE: We leave the SendQueue(Bytes|Count) unpopulated, they will be updated
@@ -1489,7 +1527,6 @@ func (rc *rangeController) updateReplicaSet(ctx context.Context, newSet ReplicaS
 			// sendQueueStatRefreshInterval duration from now.
 		})
 	}
-	rc.replicaSet = newSet
 }
 
 func (rc *rangeController) updateWaiterSetsRaftMuLocked() {
@@ -1769,7 +1806,7 @@ func (rss *replicaSendStream) changeConnectedStateLocked(state connectedState, n
 	rss.mu.connectedStateStart = now
 }
 
-func (rss *replicaSendStream) shouldPing() bool {
+func (rss *replicaSendStream) holdsTokens() bool {
 	rss.mu.Lock() // TODO(pav-kv): should we make it RWMutex.RLock()?
 	defer rss.mu.Unlock()
 	return !rss.mu.tracker.Empty()
@@ -1830,6 +1867,11 @@ func (rs *replicaState) createReplicaSendStream(
 	// RangeController.
 	rss.mu.sendQueue.approxMeanSizeBytes = 500
 	if mode == MsgAppPull && !rs.sendStream.isEmptySendQueueLocked() {
+		// NB: need to lock rss.mu since
+		// startAttemptingToEmptySendQueueViaWatcherLocked can hand a reference to
+		// rss to a different goroutine, which can start running immediately.
+		rss.mu.Lock()
+		defer rss.mu.Unlock()
 		rss.startAttemptingToEmptySendQueueViaWatcherLocked(ctx)
 	}
 }
@@ -2228,6 +2270,7 @@ func (rss *replicaSendStream) handleReadyEntriesLocked(
 				event.sendingEntries[0].id.index, rss.mu.sendQueue.indexToSend))
 		}
 		rss.mu.sendQueue.indexToSend = event.sendingEntries[n-1].id.index + 1
+		var sendTokensToDeduct [admissionpb.NumWorkClasses]kvflowcontrol.Tokens
 		for _, entry := range event.sendingEntries {
 			if !entry.usesFlowControl {
 				continue
@@ -2257,12 +2300,17 @@ func (rss *replicaSendStream) handleReadyEntriesLocked(
 				rss.mu.sendQueue.originalEvalTokens[WorkClassFromRaftPriority(entry.pri)] -= tokens
 				rss.mu.sendQueue.preciseSizeSum -= tokens
 			}
-			flag := AdjNormal
-			if directive.preventSendQNoForceFlush {
-				flag = AdjPreventSendQueue
-			}
-			rss.parent.sendTokenCounter.Deduct(ctx, WorkClassFromRaftPriority(pri), tokens, flag)
 			rss.mu.tracker.Track(ctx, entry.id, pri, tokens)
+			sendTokensToDeduct[WorkClassFromRaftPriority(pri)] += tokens
+		}
+		flag := AdjNormal
+		if directive.preventSendQNoForceFlush {
+			flag = AdjPreventSendQueue
+		}
+		for wc, tokens := range sendTokensToDeduct {
+			if tokens != 0 {
+				rss.parent.sendTokenCounter.Deduct(ctx, admissionpb.WorkClass(wc), tokens, flag)
+			}
 		}
 		if directive.preventSendQNoForceFlush {
 			rss.parent.parent.opts.RangeControllerMetrics.SendQueue.PreventionCount.Inc(1)
@@ -2274,6 +2322,7 @@ func (rss *replicaSendStream) handleReadyEntriesLocked(
 				event.newEntries[0].id.index, rss.mu.sendQueue.nextRaftIndex))
 		}
 		rss.mu.sendQueue.nextRaftIndex = event.newEntries[n-1].id.index + 1
+		var evalTokensToDeduct [admissionpb.NumWorkClasses]kvflowcontrol.Tokens
 		for _, entry := range event.newEntries {
 			if !entry.usesFlowControl {
 				continue
@@ -2309,8 +2358,13 @@ func (rss *replicaSendStream) handleReadyEntriesLocked(
 				rss.mu.sendQueue.originalEvalTokens[WorkClassFromRaftPriority(entry.pri)] += tokens
 			}
 			wc := WorkClassFromRaftPriority(pri)
-			rss.parent.evalTokenCounter.Deduct(ctx, wc, tokens, AdjNormal)
+			evalTokensToDeduct[wc] += tokens
 			rss.mu.eval.tokensDeducted[wc] += tokens
+		}
+		for wc, tokens := range evalTokensToDeduct {
+			if tokens != 0 {
+				rss.parent.evalTokenCounter.Deduct(ctx, admissionpb.WorkClass(wc), tokens, AdjNormal)
+			}
 		}
 	}
 

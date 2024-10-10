@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/errors/issuelink"
 )
 
 func init() {
@@ -94,7 +93,7 @@ func createLogicalReplicationStreamPlanHook(
 		}
 
 		if stmt.From.Database != "" {
-			return errors.UnimplementedErrorf(issuelink.IssueLink{}, "logical replication streams on databases are unsupported")
+			return errors.UnimplementedErrorf(errors.IssueLink{}, "logical replication streams on databases are unsupported")
 		}
 		if len(stmt.From.Tables) != len(stmt.Into.Tables) {
 			return pgerror.New(pgcode.InvalidParameterValue, "the same number of source and destination tables must be specified")
@@ -154,28 +153,6 @@ func createLogicalReplicationStreamPlanHook(
 			}
 			repPairs[i].DstDescriptorID = int32(td.GetID())
 			dstTableDescs[i] = td
-
-			// TODO(dt): remove when we support this via KV metadata.
-			var foundTSCol bool
-			for _, col := range td.GetColumns() {
-				if col.Name == originTimestampColumnName {
-					foundTSCol = true
-					if col.Type.Family() != types.DecimalFamily {
-						return errors.Newf(
-							"%s column must be type DECIMAL for use by logical replication", originTimestampColumnName,
-						)
-					}
-					break
-				}
-			}
-			if !foundTSCol {
-				return errors.WithHintf(errors.Newf(
-					"tables written to by logical replication currently require a %q DECIMAL column",
-					originTimestampColumnName,
-				), "try 'ALTER TABLE %s ADD COLUMN %s DECIMAL NOT VISIBLE DEFAULT NULL ON UPDATE NULL'",
-					dstObjName.String(), originTimestampColumnName,
-				)
-			}
 
 			tbNameWithSchema := tree.MakeTableNameWithSchema(
 				tree.Name(prefix.Database.GetName()),

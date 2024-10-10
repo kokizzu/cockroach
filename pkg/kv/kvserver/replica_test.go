@@ -7,12 +7,14 @@ package kvserver
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"math"
 	"math/rand"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,7 +133,7 @@ func upToDateRaftStatus(repls []roachpb.ReplicaDescriptor) *raft.Status {
 	return &raft.Status{
 		BasicStatus: raft.BasicStatus{
 			HardState: raftpb.HardState{Commit: 100, Lead: 1},
-			SoftState: raft.SoftState{RaftState: raft.StateLeader},
+			SoftState: raft.SoftState{RaftState: raftpb.StateLeader},
 		},
 		Progress: prs,
 	}
@@ -8993,9 +8995,9 @@ func TestReplicaMetrics(t *testing.T) {
 		// and 2 is ok.
 		status.HardState.Commit = 12
 		if lead == 1 {
-			status.SoftState.RaftState = raft.StateLeader
+			status.SoftState.RaftState = raftpb.StateLeader
 		} else {
-			status.SoftState.RaftState = raft.StateFollower
+			status.SoftState.RaftState = raftpb.StateFollower
 		}
 		status.HardState.Lead = lead
 		return status
@@ -9857,6 +9859,7 @@ type testQuiescer struct {
 	desc                   roachpb.RangeDescriptor
 	numProposals           int
 	pendingQuota           bool
+	sendTokens             bool
 	ticksSinceLastProposal int
 	status                 *raft.SparseStatus
 	lastIndex              kvpb.RaftIndex
@@ -9883,7 +9886,7 @@ func (q *testQuiescer) descRLocked() *roachpb.RangeDescriptor {
 }
 
 func (q *testQuiescer) isRaftLeaderRLocked() bool {
-	return q.status != nil && q.status.RaftState == raft.StateLeader
+	return q.status != nil && q.status.RaftState == raftpb.StateLeader
 }
 
 func (q *testQuiescer) raftSparseStatusRLocked() *raft.SparseStatus {
@@ -9910,6 +9913,10 @@ func (q *testQuiescer) hasPendingProposalQuotaRLocked() bool {
 	return q.pendingQuota
 }
 
+func (q *testQuiescer) hasSendTokensRaftMuLocked() bool {
+	return q.sendTokens
+}
+
 func (q *testQuiescer) ticksSinceLastProposalRLocked() int {
 	return q.ticksSinceLastProposal
 }
@@ -9931,7 +9938,7 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 
 	const logIndex = 10
 	const invalidIndex = 11
-	test := func(expected bool, transform func(q *testQuiescer) *testQuiescer) {
+	test := func(expected bool, transform func(q *testQuiescer)) {
 		t.Run("", func(t *testing.T) {
 			// A testQuiescer initialized so that shouldReplicaQuiesce will return
 			// true. The transform function is intended to perform one mutation to
@@ -9953,7 +9960,7 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 							Commit: logIndex,
 						},
 						SoftState: raft.SoftState{
-							RaftState: raft.StateLeader,
+							RaftState: raftpb.StateLeader,
 						},
 						Applied:        logIndex,
 						LeadTransferee: 0,
@@ -9985,8 +9992,9 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 					3: {IsLive: true},
 				},
 			}
-			q = transform(q)
-			_, lagging, ok := shouldReplicaQuiesce(context.Background(), q, q.leaseStatus, q.livenessMap, q.paused)
+			transform(q)
+			_, lagging, ok := shouldReplicaQuiesceRaftMuLockedReplicaMuLocked(
+				context.Background(), q, q.leaseStatus, q.livenessMap, q.paused)
 			require.Equal(t, expected, ok)
 			if ok {
 				// Any non-live replicas should be in the laggingReplicaSet.
@@ -9996,193 +10004,129 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 						expLagging = append(expLagging, l.Liveness)
 					}
 				}
-				sort.Sort(expLagging)
+				slices.SortFunc(expLagging, func(a, b livenesspb.Liveness) int {
+					return cmp.Compare(a.NodeID, b.NodeID)
+				})
 				require.Equal(t, expLagging, lagging)
 			}
 		})
 	}
 
-	test(true, func(q *testQuiescer) *testQuiescer {
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.numProposals = 1
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.pendingQuota = true
-		return q
-	})
-	test(true, func(q *testQuiescer) *testQuiescer {
+	test(true, func(q *testQuiescer) {})
+	test(false, func(q *testQuiescer) { q.numProposals = 1 })
+	test(false, func(q *testQuiescer) { q.pendingQuota = true })
+	test(false, func(q *testQuiescer) { q.sendTokens = true })
+	test(true, func(q *testQuiescer) {
 		q.ticksSinceLastProposal = quiesceAfterTicks // quiesce on quiesceAfterTicks
-		return q
 	})
-	test(true, func(q *testQuiescer) *testQuiescer {
+	test(true, func(q *testQuiescer) {
 		q.ticksSinceLastProposal = quiesceAfterTicks + 1 // quiesce above quiesceAfterTicks
-		return q
 	})
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) {
 		q.ticksSinceLastProposal = quiesceAfterTicks - 1 // don't quiesce below quiesceAfterTicks
-		return q
 	})
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) {
 		q.ticksSinceLastProposal = 0 // don't quiesce on 0
-		return q
 	})
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) {
 		q.ticksSinceLastProposal = -1 // don't quiesce on negative (shouldn't happen)
-		return q
 	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.mergeInProgress = true
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.isDestroyed = true
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.status = nil
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.status.RaftState = raft.StateFollower
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.status.RaftState = raft.StateCandidate
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.status.LeadTransferee = 1
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.status.Commit = invalidIndex
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.status.Applied = invalidIndex
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.lastIndex = invalidIndex
-		return q
-	})
+	test(false, func(q *testQuiescer) { q.mergeInProgress = true })
+	test(false, func(q *testQuiescer) { q.isDestroyed = true })
+	test(false, func(q *testQuiescer) { q.status = nil })
+	test(false, func(q *testQuiescer) { q.status.RaftState = raftpb.StateFollower })
+	test(false, func(q *testQuiescer) { q.status.RaftState = raftpb.StateCandidate })
+	test(false, func(q *testQuiescer) { q.status.LeadTransferee = 1 })
+	test(false, func(q *testQuiescer) { q.status.Commit = invalidIndex })
+	test(false, func(q *testQuiescer) { q.status.Applied = invalidIndex })
+	test(false, func(q *testQuiescer) { q.lastIndex = invalidIndex })
 	for _, i := range []raftpb.PeerID{1, 2, 3} {
-		test(false, func(q *testQuiescer) *testQuiescer {
+		test(false, func(q *testQuiescer) {
 			q.status.Progress[i] = tracker.Progress{Match: invalidIndex}
-			return q
 		})
 	}
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) {
 		delete(q.status.Progress, q.status.ID)
-		return q
 	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.storeID = 9
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_ERROR
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_UNUSABLE
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_EXPIRED
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_PROSCRIBED
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.raftReady = true
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) { q.storeID = 9 })
+
+	for _, leaseState := range []kvserverpb.LeaseState{
+		kvserverpb.LeaseState_ERROR,
+		kvserverpb.LeaseState_UNUSABLE,
+		kvserverpb.LeaseState_EXPIRED,
+		kvserverpb.LeaseState_PROSCRIBED,
+	} {
+		test(false, func(q *testQuiescer) { q.leaseStatus.State = leaseState })
+	}
+	test(false, func(q *testQuiescer) { q.raftReady = true })
+	test(false, func(q *testQuiescer) {
 		pr := q.status.Progress[2]
 		pr.State = tracker.StateProbe
 		q.status.Progress[2] = pr
-		return q
 	})
 	// Create a mismatch between the raft progress replica IDs and the
 	// replica IDs in the range descriptor.
 	for i := 0; i < 3; i++ {
-		test(false, func(q *testQuiescer) *testQuiescer {
+		test(false, func(q *testQuiescer) {
 			q.desc.InternalReplicas[i].ReplicaID = roachpb.ReplicaID(4 + i)
-			return q
 		})
 	}
 	// Pass a nil liveness map.
-	test(true, func(q *testQuiescer) *testQuiescer {
-		q.livenessMap = nil
-		return q
-	})
+	test(true, func(q *testQuiescer) { q.livenessMap = nil })
 	// Verify quiesce even when replica progress doesn't match, if
 	// the replica is on a non-live node.
 	for _, i := range []raftpb.PeerID{1, 2, 3} {
-		test(true, func(q *testQuiescer) *testQuiescer {
+		test(true, func(q *testQuiescer) {
 			nodeID := roachpb.NodeID(i)
 			q.livenessMap[nodeID] = livenesspb.IsLiveMapEntry{
 				Liveness: livenesspb.Liveness{NodeID: nodeID},
 				IsLive:   false,
 			}
 			q.status.Progress[i] = tracker.Progress{Match: invalidIndex}
-			return q
 		})
 	}
 	// Verify no quiescence when replica progress doesn't match, if
 	// given a nil liveness map.
 	for _, i := range []raftpb.PeerID{1, 2, 3} {
-		test(false, func(q *testQuiescer) *testQuiescer {
+		test(false, func(q *testQuiescer) {
 			q.livenessMap = nil
 			q.status.Progress[i] = tracker.Progress{Match: invalidIndex}
-			return q
 		})
 	}
 	// Verify no quiescence when replica progress doesn't match, if
 	// liveness map does not contain the lagging replica.
 	for _, i := range []raftpb.PeerID{1, 2, 3} {
-		test(false, func(q *testQuiescer) *testQuiescer {
+		test(false, func(q *testQuiescer) {
 			delete(q.livenessMap, roachpb.NodeID(i))
 			q.status.Progress[i] = tracker.Progress{Match: invalidIndex}
-			return q
 		})
 	}
 	// Verify no quiescence when a follower is paused.
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) {
 		q.paused = map[roachpb.ReplicaID]struct{}{
 			q.desc.Replicas().Descriptors()[0].ReplicaID: {},
 		}
-		return q
 	})
 	// Verify no quiescence with expiration-based leases, regardless
 	// of kv.expiration_leases_only.enabled.
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) {
 		ExpirationLeasesOnly.Override(context.Background(), &q.st.SV, true)
 		q.leaseStatus.Lease.Epoch = 0
 		q.leaseStatus.Lease.Expiration = &hlc.Timestamp{
 			WallTime: timeutil.Now().Add(time.Minute).Unix(),
 		}
-		return q
 	})
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) {
 		ExpirationLeasesOnly.Override(context.Background(), &q.st.SV, false)
 		q.leaseStatus.Lease.Epoch = 0
 		q.leaseStatus.Lease.Expiration = &hlc.Timestamp{
 			WallTime: timeutil.Now().Add(time.Minute).Unix(),
 		}
-		return q
 	})
 	// Verify no quiescence with leader leases.
-	test(false, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) {
 		q.leaseStatus.Lease.Epoch = 0
 		q.leaseStatus.Lease.Term = 1
-		return q
 	})
 }
 
@@ -11563,7 +11507,7 @@ func TestReplicaShouldCampaignOnWake(t *testing.T) {
 		},
 		raftStatus: raft.BasicStatus{
 			SoftState: raft.SoftState{
-				RaftState: raft.StateFollower,
+				RaftState: raftpb.StateFollower,
 			},
 			HardState: raftpb.HardState{
 				Lead: 2,
@@ -11589,15 +11533,15 @@ func TestReplicaShouldCampaignOnWake(t *testing.T) {
 			p.leaseStatus.Lease.Replica.StoreID = 1
 		}},
 		"pre-candidate": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StatePreCandidate
+			p.raftStatus.SoftState.RaftState = raftpb.StatePreCandidate
 			p.raftStatus.Lead = raft.None
 		}},
 		"candidate": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StateCandidate
+			p.raftStatus.SoftState.RaftState = raftpb.StateCandidate
 			p.raftStatus.Lead = raft.None
 		}},
 		"leader": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StateLeader
+			p.raftStatus.SoftState.RaftState = raftpb.StateLeader
 			p.raftStatus.Lead = 1
 		}},
 		"unknown leader": {true, func(p *params) {
@@ -11683,7 +11627,7 @@ func TestReplicaShouldCampaignOnLeaseRequestRedirect(t *testing.T) {
 		},
 		raftStatus: raft.BasicStatus{
 			SoftState: raft.SoftState{
-				RaftState: raft.StateFollower,
+				RaftState: raftpb.StateFollower,
 			},
 			HardState: raftpb.HardState{
 				Lead: 2,
@@ -11704,15 +11648,15 @@ func TestReplicaShouldCampaignOnLeaseRequestRedirect(t *testing.T) {
 	}{
 		"dead leader": {true, func(p *params) {}},
 		"pre-candidate": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StatePreCandidate
+			p.raftStatus.SoftState.RaftState = raftpb.StatePreCandidate
 			p.raftStatus.Lead = raft.None
 		}},
 		"candidate": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StateCandidate
+			p.raftStatus.SoftState.RaftState = raftpb.StateCandidate
 			p.raftStatus.Lead = raft.None
 		}},
 		"leader": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StateLeader
+			p.raftStatus.SoftState.RaftState = raftpb.StateLeader
 			p.raftStatus.Lead = 1
 		}},
 		"unknown leader": {true, func(p *params) {
@@ -11800,7 +11744,7 @@ func TestReplicaShouldForgetLeaderOnVoteRequest(t *testing.T) {
 		},
 		raftStatus: raft.BasicStatus{
 			SoftState: raft.SoftState{
-				RaftState: raft.StateFollower,
+				RaftState: raftpb.StateFollower,
 			},
 			HardState: raftpb.HardState{
 				Lead: 2,
@@ -11820,15 +11764,15 @@ func TestReplicaShouldForgetLeaderOnVoteRequest(t *testing.T) {
 	}{
 		"dead leader": {true, func(p *params) {}},
 		"pre-candidate": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StatePreCandidate
+			p.raftStatus.SoftState.RaftState = raftpb.StatePreCandidate
 			p.raftStatus.Lead = raft.None
 		}},
 		"candidate": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StateCandidate
+			p.raftStatus.SoftState.RaftState = raftpb.StateCandidate
 			p.raftStatus.Lead = raft.None
 		}},
 		"leader": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StateLeader
+			p.raftStatus.SoftState.RaftState = raftpb.StateLeader
 			p.raftStatus.Lead = 1
 		}},
 		"unknown leader": {false, func(p *params) {
@@ -11904,7 +11848,7 @@ func TestReplicaShouldTransferRaftLeadershipToLeaseholder(t *testing.T) {
 		raftStatus: raft.SparseStatus{
 			BasicStatus: raft.BasicStatus{
 				SoftState: raft.SoftState{
-					RaftState: raft.StateLeader,
+					RaftState: raftpb.StateLeader,
 				},
 				HardState: raftpb.HardState{
 					Lead:   localID,
@@ -11934,15 +11878,15 @@ func TestReplicaShouldTransferRaftLeadershipToLeaseholder(t *testing.T) {
 			true, func(p *params) {},
 		},
 		"follower": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StateFollower
+			p.raftStatus.SoftState.RaftState = raftpb.StateFollower
 			p.raftStatus.Lead = remoteID
 		}},
 		"pre-candidate": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StatePreCandidate
+			p.raftStatus.SoftState.RaftState = raftpb.StatePreCandidate
 			p.raftStatus.Lead = raft.None
 		}},
 		"candidate": {false, func(p *params) {
-			p.raftStatus.SoftState.RaftState = raft.StateCandidate
+			p.raftStatus.SoftState.RaftState = raftpb.StateCandidate
 			p.raftStatus.Lead = raft.None
 		}},
 		"invalid lease": {false, func(p *params) {

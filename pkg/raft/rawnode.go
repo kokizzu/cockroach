@@ -18,10 +18,9 @@
 package raft
 
 import (
-	"errors"
-
 	pb "github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
+	"github.com/cockroachdb/errors"
 )
 
 // ErrStepLocalMsg is returned when try to step a local raft message
@@ -169,7 +168,7 @@ func (rn *RawNode) SetLazyReplication(lazy bool) {
 	}
 	// The lazy mode was disabled. We need to check whether any replication flows
 	// are unblocked and can be saturated.
-	if r.state == StateLeader {
+	if r.state == pb.StateLeader {
 		// TODO(pav-kv): this sends at most one MsgApp message per peer. It may not
 		// completely saturate the flow. Consider looping while maybeSendAppend()
 		// returns true.
@@ -628,6 +627,12 @@ const (
 // peers.
 func (rn *RawNode) WithProgress(visitor func(id pb.PeerID, typ ProgressType, pr tracker.Progress)) {
 	withProgress(rn.raft, visitor)
+}
+
+// WithBasicProgress is a helper to introspect the BasicProgress for this node
+// and its peers.
+func (rn *RawNode) WithBasicProgress(visitor func(id pb.PeerID, pr tracker.BasicProgress)) {
+	rn.raft.trk.WithBasicProgress(visitor)
 }
 
 // ReportUnreachable reports the given node is not reachable for the last send.

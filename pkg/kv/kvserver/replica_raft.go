@@ -573,6 +573,15 @@ func (r *Replica) hasPendingProposalQuotaRLocked() bool {
 	return !r.mu.proposalQuota.Full()
 }
 
+// hasSendTokensRaftMuLocked is part of the quiescer interface. It returns true
+// if RACv2 holds any send tokens for this range.
+//
+// We can't quiesce while any send tokens are held because this could lead to
+// never releasing them. Tokens must be released.
+func (r *Replica) hasSendTokensRaftMuLocked() bool {
+	return r.flowControlV2.HoldsSendTokensRaftMuLocked()
+}
+
 // ticksSinceLastProposalRLocked returns the number of ticks since the last
 // proposal.
 func (r *Replica) ticksSinceLastProposalRLocked() int {
@@ -622,7 +631,7 @@ func (r *Replica) stepRaftGroupRaftMuLocked(req *kvserverpb.RaftMessageRequest) 
 		// mass unquiescence due to the continuous prevotes.
 		if r.mu.quiescent {
 			st := r.raftBasicStatusRLocked()
-			hasLeader := st.RaftState == raft.StateFollower && st.Lead != 0
+			hasLeader := st.RaftState == raftpb.StateFollower && st.Lead != 0
 			fromLeader := raftpb.PeerID(req.FromReplica.ReplicaID) == st.Lead
 			wakeLeader := hasLeader && !fromLeader
 			r.maybeUnquiesceLocked(wakeLeader, false /* mayCampaign */)
@@ -1392,112 +1401,110 @@ func (r *Replica) tick(
 ) (exists bool, err error) {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
-	exists, err = func() (bool, error) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-
-		// If the replica has been destroyed, don't tick it.
-		if r.mu.internalRaftGroup == nil {
-			return false, nil
+	defer func() {
+		if exists && err == nil {
+			// NB: since we are returning true, there will be a Ready handling
+			// immediately after this call, so any pings stashed in raft will be sent.
+			// NB: Replica.mu must not be held here.
+			r.flowControlV2.MaybeSendPingsRaftMuLocked()
 		}
-
-		if r.mu.quiescent {
-			return false, nil
-		}
-
-		r.unreachablesMu.Lock()
-		remotes := r.unreachablesMu.remotes
-		r.unreachablesMu.remotes = nil
-		r.unreachablesMu.Unlock()
-		bypassFn := r.store.TestingKnobs().RaftReportUnreachableBypass
-		for remoteReplica := range remotes {
-			if bypassFn != nil && bypassFn(remoteReplica) {
-				continue
-			}
-			r.mu.internalRaftGroup.ReportUnreachable(raftpb.PeerID(remoteReplica))
-		}
-
-		r.updatePausedFollowersLocked(ctx, ioThresholdMap)
-
-		storeClockTimestamp := r.store.Clock().NowAsClockTimestamp()
-		leaseStatus := r.leaseStatusAtRLocked(ctx, storeClockTimestamp)
-		// TODO(pav-kv): modify the quiescence criterion so that we don't quiesce if
-		// RACv2 holds some send tokens.
-		if r.maybeQuiesceRaftMuLockedReplicaMuLocked(ctx, leaseStatus, livenessMap) {
-			return false, nil
-		}
-
-		r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx, leaseStatus)
-
-		// Eagerly acquire or extend leases. This only works for unquiesced ranges. We
-		// never quiesce expiration leases, but for epoch leases we fall back to the
-		// replicate queue which will do this within 10 minutes.
-		if !r.store.cfg.TestingKnobs.DisableAutomaticLeaseRenewal {
-			if shouldRequest, isExtension := r.shouldRequestLeaseRLocked(leaseStatus); shouldRequest {
-				if _, requestPending := r.mu.pendingLeaseRequest.RequestPending(); !requestPending {
-					var limiter *quotapool.IntPool
-					if !isExtension { // don't limit lease extensions
-						limiter = r.store.eagerLeaseAcquisitionLimiter
-					}
-					// Check quota first to avoid wasted work.
-					if limiter == nil || limiter.ApproximateQuota() > 0 {
-						_ = r.requestLeaseLocked(ctx, leaseStatus, limiter)
-					}
-				}
-			}
-		}
-
-		// For followers, we update lastUpdateTimes when we step a message from them
-		// into the local Raft group. The leader won't hit that path, so we update
-		// it whenever it ticks. In effect, this makes sure it always sees itself as
-		// alive.
-		//
-		// Note that in a workload where the leader doesn't have inflight requests
-		// "most of the time" (i.e. occasional writes only on this range), it's quite
-		// likely that we'll never reach this line, since we'll return in the
-		// maybeQuiesceRaftMuLockedReplicaMuLocked branch above.
-		//
-		// This is likely unintentional, and the leader should likely consider itself
-		// live even when quiesced.
-		if r.isRaftLeaderRLocked() {
-			r.mu.lastUpdateTimes.update(r.replicaID, r.Clock().PhysicalTime())
-			// We also update lastUpdateTimes for replicas that provide store liveness
-			// support to the leader.
-			r.updateLastUpdateTimesUsingStoreLivenessRLocked(storeClockTimestamp)
-		}
-
-		r.mu.ticks++
-		preTickState := r.mu.internalRaftGroup.BasicStatus().RaftState
-		r.mu.internalRaftGroup.Tick()
-		postTickState := r.mu.internalRaftGroup.BasicStatus().RaftState
-		if preTickState != postTickState {
-			if postTickState == raft.StatePreCandidate {
-				r.store.Metrics().RaftTimeoutCampaign.Inc(1)
-				if k := r.store.TestingKnobs(); k != nil && k.OnRaftTimeoutCampaign != nil {
-					k.OnRaftTimeoutCampaign(r.RangeID)
-				}
-			}
-		}
-
-		refreshAtDelta := r.store.cfg.RaftReproposalTimeoutTicks
-		if knob := r.store.TestingKnobs().RefreshReasonTicksPeriod; knob > 0 {
-			refreshAtDelta = knob
-		}
-		if !r.store.TestingKnobs().DisableRefreshReasonTicks && r.mu.ticks%refreshAtDelta == 0 {
-			// The combination of the above condition and passing refreshAtDelta to
-			// refreshProposalsLocked means that commands will be refreshed when they
-			// have been pending for 1 to 2 reproposal timeouts.
-			r.refreshProposalsLocked(ctx, refreshAtDelta, reasonTicks)
-		}
-		return true, nil
 	}()
-	if !exists || err != nil {
-		return exists, err
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// If the replica has been destroyed or is quiesced, don't tick it.
+	if r.mu.internalRaftGroup == nil {
+		return false, nil
+	}
+	if r.mu.quiescent {
+		return false, nil
 	}
 
-	// NB: since we are returning true below, there will be a Ready handling
-	// immediately after this call, so any pings stashed in raft will be sent.
-	r.flowControlV2.MaybeSendPingsRaftMuLocked()
+	r.unreachablesMu.Lock()
+	remotes := r.unreachablesMu.remotes
+	r.unreachablesMu.remotes = nil
+	r.unreachablesMu.Unlock()
+	bypassFn := r.store.TestingKnobs().RaftReportUnreachableBypass
+	for remoteReplica := range remotes {
+		if bypassFn != nil && bypassFn(remoteReplica) {
+			continue
+		}
+		r.mu.internalRaftGroup.ReportUnreachable(raftpb.PeerID(remoteReplica))
+	}
+
+	r.updatePausedFollowersLocked(ctx, ioThresholdMap)
+
+	storeClockTimestamp := r.store.Clock().NowAsClockTimestamp()
+	leaseStatus := r.leaseStatusAtRLocked(ctx, storeClockTimestamp)
+	// TODO(pav-kv): modify the quiescence criterion so that we don't quiesce if
+	// RACv2 holds some send tokens.
+	if r.maybeQuiesceRaftMuLockedReplicaMuLocked(ctx, leaseStatus, livenessMap) {
+		return false, nil
+	}
+
+	r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx, leaseStatus)
+
+	// Eagerly acquire or extend leases. This only works for unquiesced ranges. We
+	// never quiesce expiration leases, but for epoch leases we fall back to the
+	// replicate queue which will do this within 10 minutes.
+	if !r.store.cfg.TestingKnobs.DisableAutomaticLeaseRenewal {
+		if shouldRequest, isExtension := r.shouldRequestLeaseRLocked(leaseStatus); shouldRequest {
+			if _, requestPending := r.mu.pendingLeaseRequest.RequestPending(); !requestPending {
+				var limiter *quotapool.IntPool
+				if !isExtension { // don't limit lease extensions
+					limiter = r.store.eagerLeaseAcquisitionLimiter
+				}
+				// Check quota first to avoid wasted work.
+				if limiter == nil || limiter.ApproximateQuota() > 0 {
+					_ = r.requestLeaseLocked(ctx, leaseStatus, limiter)
+				}
+			}
+		}
+	}
+
+	// For followers, we update lastUpdateTimes when we step a message from them
+	// into the local Raft group. The leader won't hit that path, so we update
+	// it whenever it ticks. In effect, this makes sure it always sees itself as
+	// alive.
+	//
+	// Note that in a workload where the leader doesn't have inflight requests
+	// "most of the time" (i.e. occasional writes only on this range), it's quite
+	// likely that we'll never reach this line, since we'll return in the
+	// maybeQuiesceRaftMuLockedReplicaMuLocked branch above.
+	//
+	// This is likely unintentional, and the leader should likely consider itself
+	// live even when quiesced.
+	if r.isRaftLeaderRLocked() {
+		r.mu.lastUpdateTimes.update(r.replicaID, r.Clock().PhysicalTime())
+		// We also update lastUpdateTimes for replicas that provide store liveness
+		// support to the leader.
+		r.updateLastUpdateTimesUsingStoreLivenessRLocked(storeClockTimestamp)
+	}
+
+	r.mu.ticks++
+	preTickState := r.mu.internalRaftGroup.BasicStatus().RaftState
+	r.mu.internalRaftGroup.Tick()
+	postTickState := r.mu.internalRaftGroup.BasicStatus().RaftState
+	if preTickState != postTickState {
+		if postTickState == raftpb.StatePreCandidate {
+			r.store.Metrics().RaftTimeoutCampaign.Inc(1)
+			if k := r.store.TestingKnobs(); k != nil && k.OnRaftTimeoutCampaign != nil {
+				k.OnRaftTimeoutCampaign(r.RangeID)
+			}
+		}
+	}
+
+	refreshAtDelta := r.store.cfg.RaftReproposalTimeoutTicks
+	if knob := r.store.TestingKnobs().RefreshReasonTicksPeriod; knob > 0 {
+		refreshAtDelta = knob
+	}
+	if !r.store.TestingKnobs().DisableRefreshReasonTicks && r.mu.ticks%refreshAtDelta == 0 {
+		// The combination of the above condition and passing refreshAtDelta to
+		// refreshProposalsLocked means that commands will be refreshed when they
+		// have been pending for 1 to 2 reproposal timeouts.
+		r.refreshProposalsLocked(ctx, refreshAtDelta, reasonTicks)
+	}
 	return true, nil
 }
 
@@ -1986,7 +1993,7 @@ func (r *Replica) sendRaftMessage(
 		// below for more context:
 		_ = maybeDropMsgApp
 		// NB: this code is allocation free.
-		r.mu.internalRaftGroup.WithProgress(func(id raftpb.PeerID, _ raft.ProgressType, pr tracker.Progress) {
+		r.mu.internalRaftGroup.WithBasicProgress(func(id raftpb.PeerID, pr tracker.BasicProgress) {
 			if id == msg.To && pr.State == tracker.StateProbe {
 				// It is moderately expensive to attach a full key to the message, but note that
 				// a probing follower will only be appended to once per heartbeat interval (i.e.
@@ -2310,7 +2317,7 @@ func shouldCampaignOnWake(
 		return false
 	}
 	// If we're already campaigning don't start a new term.
-	if raftStatus.RaftState != raft.StateFollower {
+	if raftStatus.RaftState != raftpb.StateFollower {
 		return false
 	}
 	// If we don't know who the leader is, then campaign.
@@ -2421,7 +2428,7 @@ func shouldForgetLeaderOnVoteRequest(
 	now hlc.Timestamp,
 ) bool {
 	// If we're not a follower with a leader, there's noone to forget.
-	if raftStatus.RaftState != raft.StateFollower || raftStatus.Lead == raft.None {
+	if raftStatus.RaftState != raftpb.StateFollower || raftStatus.Lead == raft.None {
 		return false
 	}
 
@@ -2472,7 +2479,7 @@ func shouldCampaignOnLeaseRequestRedirect(
 	now hlc.Timestamp,
 ) bool {
 	// If we're already campaigning don't start a new term.
-	if raftStatus.RaftState != raft.StateFollower {
+	if raftStatus.RaftState != raftpb.StateFollower {
 		return false
 	}
 	// If we don't know who the leader is, then campaign.
@@ -2650,7 +2657,7 @@ func shouldTransferRaftLeadershipToLeaseholderLocked(
 	draining bool,
 ) bool {
 	// If we're not the leader, there's nothing to do.
-	if raftStatus.RaftState != raft.StateLeader {
+	if raftStatus.RaftState != raftpb.StateLeader {
 		return false
 	}
 
@@ -3007,7 +3014,7 @@ func shouldCampaignAfterConfChange(
 		// throwing spurious elections.
 		return false
 	}
-	if raftStatus.RaftState == raft.StateLeader {
+	if raftStatus.RaftState == raftpb.StateLeader {
 		// We're already the leader, no point in campaigning.
 		return false
 	}
