@@ -3172,7 +3172,7 @@ func TestProvideSnap(t *testing.T) {
 	sm.becomeLeader()
 
 	// force set the next of node 2, so that node 2 needs a snapshot
-	sm.trk.Progress(2).Next = sm.raftLog.firstIndex()
+	sm.trk.Progress(2).Next = sm.raftLog.compacted() + 1
 	sm.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAppResp, Index: sm.trk.Progress(2).Next - 1, Reject: true})
 
 	msgs := sm.readMessages()
@@ -3201,7 +3201,7 @@ func TestIgnoreProvidingSnap(t *testing.T) {
 
 	// force set the next of node 2, so that node 2 needs a snapshot
 	// change node 2 to be inactive, expect node 1 ignore sending snapshot to 2
-	sm.trk.Progress(2).Next = sm.raftLog.firstIndex() - 1
+	sm.trk.Progress(2).Next = sm.raftLog.compacted()
 	sm.trk.Progress(2).RecentActive = false
 
 	sm.Step(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("somedata")}}})
@@ -5095,6 +5095,77 @@ func TestFortificationMetrics(t *testing.T) {
 	require.Equal(t, int64(1), n1.metrics.RejectedFortificationResponses.Count())
 	// The leader should skip sending a MsgFortify to 3.
 	require.Equal(t, int64(1), n1.metrics.SkippedFortificationDueToLackOfSupport.Count())
+}
+
+// TestPeerForgetsLeaderWhenIsolated ensures that peers forget the leader when
+// they are isolated.
+func TestPeerForgetsLeaderWhenIsolated(t *testing.T) {
+	testutils.RunTrueAndFalse(t, "store-liveness-enabled",
+		func(t *testing.T, storeLivenessEnabled bool) {
+			testPeerForgetsLeaderWhenIsolated(t, storeLivenessEnabled)
+		})
+}
+
+func testPeerForgetsLeaderWhenIsolated(t *testing.T, storeLivenessEnabled bool) {
+	var n1, n2 *raft
+	var fabric *raftstoreliveness.LivenessFabric
+
+	if storeLivenessEnabled {
+		fabric = raftstoreliveness.NewLivenessFabricWithPeers(1, 2)
+		n1 = newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2)),
+			withStoreLiveness(fabric.GetStoreLiveness(1)))
+		n2 = newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2)),
+			withStoreLiveness(fabric.GetStoreLiveness(2)))
+	} else {
+		n1 = newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2)),
+			withStoreLiveness(raftstoreliveness.Disabled{}))
+		n2 = newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2)),
+			withStoreLiveness(raftstoreliveness.Disabled{}))
+	}
+
+	n1.becomeFollower(1, None)
+	n2.becomeFollower(1, None)
+
+	n1.preVote = true
+	n2.preVote = true
+
+	n1.checkQuorum = true
+	n2.checkQuorum = true
+
+	// Randomly select a leader between node 1, and 2.
+	leader := pb.PeerID(rand.Intn(2) + 1)
+	nt := newNetworkWithConfigAndLivenessFabric(nil, fabric, n1, n2)
+	nt.send(pb.Message{From: leader, To: leader, Type: pb.MsgHup})
+
+	// Iterate over all peers and check that they have the same leader.
+	for _, peer := range nt.peers {
+		sm := peer.(*raft)
+		require.Equal(t, leader, sm.lead)
+	}
+
+	// Isolate node one from the quorum.
+	nt.isolate(1)
+	if storeLivenessEnabled {
+		nt.livenessFabric.SetSupportExpired(1, true)
+		nt.livenessFabric.Isolate(1)
+	}
+
+	// Tick node 1 until it attempts to campaign.
+	for i := int64(0); i < 2*n1.randomizedElectionTimeout; i++ {
+		n1.tick()
+	}
+
+	// If storeliveness is enabled, the follower will never become a
+	// pre-candidate since it's not supported by a quorum. However, if
+	// storeliveness is disabled, the follower may become a pre-candidate.
+	if storeLivenessEnabled {
+		require.Equal(t, pb.StateFollower, n1.state)
+	} else {
+		require.True(t, n1.state == pb.StateFollower || n1.state == pb.StatePreCandidate)
+	}
+
+	// Make sure that 1 has forgotten the leader.
+	require.Equal(t, None, n1.lead)
 }
 
 func expectOneMessage(t *testing.T, r *raft) pb.Message {

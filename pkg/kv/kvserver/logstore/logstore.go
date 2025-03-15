@@ -590,9 +590,9 @@ func (s *LogStore) ComputeSize(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// The remaining bytes if one were to truncate [0, 0) gives us the total
+	// The remaining bytes if one were to truncate (0, 0] gives us the total
 	// number of bytes in sideloaded files.
-	_, totalSideloaded, err := s.Sideload.BytesIfTruncatedFromTo(ctx, 0, 0)
+	_, totalSideloaded, err := s.Sideload.BytesIfTruncatedFromTo(ctx, kvpb.RaftSpan{})
 	if err != nil {
 		return 0, err
 	}
@@ -601,7 +601,7 @@ func (s *LogStore) ComputeSize(ctx context.Context) (int64, error) {
 
 // LoadTerm returns the term of the entry at the given index for the specified
 // range. The result is loaded from the storage engine if it's not in the cache.
-// The valid range for index is [FirstIndex-1, LastIndex].
+// The valid range for index is [Compacted, LastIndex].
 //
 // There are 3 cases for when the term is not found: (1) the index has been
 // compacted away, (2) index > LastIndex, or (3) there is a gap in the log. In
@@ -675,7 +675,7 @@ func LoadTerm(
 // entries. The size of the returned entries does not exceed maxSize, unless the
 // first entry exceeds the limit (in which case it is returned regardless).
 //
-// The valid range for lo/hi is: FirstIndex <= lo <= hi <= LastIndex+1.
+// The valid range for lo/hi is: Compacted < lo <= hi <= LastIndex+1.
 //
 // There are 3 cases for when an entry is not found: (1) the lo index has been
 // compacted away, (2) hi > LastIndex+1, or (3) there is a gap in the log. In

@@ -1115,7 +1115,7 @@ func getDefaultSaveFlowsFunc(
 		var explainVecVerbose []string
 		if planner.instrumentation.collectBundle && vectorized {
 			flowCtx := newFlowCtxForExplainPurposes(ctx, planner)
-			flowCtx.Local = !planner.curPlan.flags.IsDistributed()
+			flowCtx.Local = !planner.curPlan.flags.ShouldBeDistributed()
 			getExplain := func(verbose bool) []string {
 				gatewaySQLInstanceID := planner.extendedEvalCtx.DistSQLPlanner.gatewaySQLInstanceID
 				// When we're collecting the bundle, we're always recording the
@@ -4622,7 +4622,8 @@ func (dsp *DistSQLPlanner) planVectorMutationSearch(
 		suffixKeyColumnOrdinals[i] = uint32(p.PlanToStreamColMap[col])
 	}
 	keyAndSuffixCols := planInfo.table.IndexFetchSpecKeyAndSuffixColumns(planInfo.index)
-	prefixKeyCols := keyAndSuffixCols[planInfo.index.NumKeyColumns()-1:]
+	// Prefix cols do not include the vector column, which is the last key column.
+	prefixKeyCols := keyAndSuffixCols[:planInfo.index.NumKeyColumns()-1]
 	suffixKeyCols := keyAndSuffixCols[planInfo.index.NumKeyColumns():]
 	spec := &execinfrapb.VectorMutationSearchSpec{
 		PrefixKeyColumnOrdinals:  prefixKeyColumnOrdinals,

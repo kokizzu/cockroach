@@ -7547,6 +7547,7 @@ func TestEntries(t *testing.T) {
 	})
 }
 
+// TODO(pav-kv): this test belongs to logstore. And requires a cleanup.
 func TestTerm(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -7587,7 +7588,7 @@ func TestTerm(t *testing.T) {
 		repl.mu.Lock()
 		defer repl.mu.Unlock()
 
-		firstIndex := repl.raftFirstIndexRLocked()
+		firstIndex := repl.raftCompactedIndexRLocked() + 1
 		if firstIndex != indexes[5] {
 			t.Fatalf("expected firstIndex %d to be %d", firstIndex, indexes[4])
 		}
@@ -7600,7 +7601,6 @@ func TestTerm(t *testing.T) {
 			t.Errorf("expected ErrCompacted, got %s", err)
 		}
 
-		// FirstIndex-1 should return the term of firstIndex.
 		firstIndexTerm, err := tc.repl.raftTermLocked(firstIndex)
 		if err != nil {
 			t.Errorf("expect no error, got %s", err)
@@ -15399,4 +15399,44 @@ func TestLockAcquisitions1PCInteractions(t *testing.T) {
 			})
 		})
 	})
+}
+
+// TestLeaderlessWatcherInit tests that the leaderless watcher is initialized
+// correctly.
+func TestLeaderlessWatcherInit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	tc := testContext{}
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	// Set the leaderless threshold to 10 second.
+	tsc := TestStoreConfig(nil /* clock */)
+	ReplicaLeaderlessUnavailableThreshold.Override(ctx, &tsc.Settings.SV, 10*time.Second)
+	tc.StartWithStoreConfig(ctx, t, stopper, tsc)
+
+	repl, err := tc.store.GetReplica(1)
+	require.NoError(t, err)
+
+	repl.LeaderlessWatcher.mu.RLock()
+	defer repl.LeaderlessWatcher.mu.RUnlock()
+
+	// Initially, the leaderWatcher doesn't consider the replica as unavailable.
+	require.False(t, repl.LeaderlessWatcher.IsUnavailable())
+
+	// The leaderless timestamp is not set.
+	require.Equal(t, time.Time{}, repl.LeaderlessWatcher.mu.leaderlessTimestamp)
+
+	// The error is always loaded.
+	require.Regexp(t, "replica has been leaderless for 10s", repl.LeaderlessWatcher.Err())
+
+	// The channel is closed.
+	c := repl.LeaderlessWatcher.C()
+	select {
+	case <-c:
+		// Channel is closed, which is expected
+	default:
+		t.Fatalf("expected LeaderlessWatcher channel to be closed")
+	}
 }

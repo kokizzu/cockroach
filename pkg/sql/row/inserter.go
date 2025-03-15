@@ -123,20 +123,6 @@ func insertPutMustAcquireExclusiveLockFn(
 	b.PutMustAcquireExclusiveLock(key, value)
 }
 
-// insertDelFn is used by insertRow to delete existing rows.
-func insertDelFn(
-	ctx context.Context,
-	b Putter,
-	key *roachpb.Key,
-	traceKV bool,
-	keyEncodingDirs []encoding.Direction,
-) {
-	if traceKV {
-		log.VEventfDepth(ctx, 1, 2, "Del %s", keys.PrettyPrint(keyEncodingDirs, *key))
-	}
-	b.Del(key)
-}
-
 func writeTombstones(
 	ctx context.Context,
 	helper *RowHelper,
@@ -184,6 +170,7 @@ func (ri *Inserter) InsertRow(
 	b Putter,
 	values []tree.Datum,
 	pm PartialIndexUpdateHelper,
+	vh VectorIndexUpdateHelper,
 	oth *OriginTimestampCPutHelper,
 	kvOp KVInsertOp,
 	traceKV bool,
@@ -205,7 +192,7 @@ func (ri *Inserter) InsertRow(
 	// We don't want to insert empty k/v's like this, so we
 	// set includeEmpty to false.
 	primaryIndexKey, secondaryIndexEntries, err := ri.Helper.encodeIndexes(
-		ctx, ri.InsertColIDtoRowIndex, values, pm.IgnoreForPut, false, /* includeEmpty */
+		ctx, ri.InsertColIDtoRowIndex, values, vh.GetPut(), pm.IgnoreForPut, false, /* includeEmpty */
 	)
 	if err != nil {
 		return err

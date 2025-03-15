@@ -3036,7 +3036,6 @@ func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 				`drop_column: [2]->{"after": {"a": 2, "b": "2"}}`,
 			})
 			sqlDB.Exec(t, `ALTER TABLE drop_column DROP COLUMN b`)
-			sqlDB.Exec(t, `INSERT INTO drop_column VALUES (3)`)
 			ts := schematestutils.FetchDescVersionModificationTime(t, s.TestServer.Server, `d`, `public`, `drop_column`, 2)
 
 			// Backfill for DROP COLUMN b.
@@ -3047,7 +3046,8 @@ func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 					ts.AsOfSystemTime()),
 			})
 
-			// Insert 3 into drop_column
+			// Insert 3 into drop_column.
+			sqlDB.Exec(t, `INSERT INTO drop_column VALUES (3)`)
 			assertPayloadsStripTs(t, dropColumn, []string{
 				`drop_column: [3]->{"after": {"a": 3}}`,
 			})
@@ -3088,6 +3088,7 @@ func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 			// version 2. Then, when adding column c, it goes from 9->17, with the schema change being visible at
 			// the 7th step (version 15). Finally, when adding column d, it goes from 17->25 ith the schema change
 			// being visible at the 7th step (version 23).
+			// TODO(#142936): Investigate if this descriptor version hardcoding is sound.
 			dropTS := schematestutils.FetchDescVersionModificationTime(t, s.TestServer.Server, `d`, `public`, `multiple_alters`, 2)
 			addTS := schematestutils.FetchDescVersionModificationTime(t, s.TestServer.Server, `d`, `public`, `multiple_alters`, 15)
 			addTS2 := schematestutils.FetchDescVersionModificationTime(t, s.TestServer.Server, `d`, `public`, `multiple_alters`, 23)
@@ -3938,7 +3939,8 @@ func TestChangefeedEnriched(t *testing.T) {
 	// Create an enriched source provider with no data. The contents of source
 	// will be tested in another test, we just want to make sure the structure &
 	// schema is right here.
-	esp := newEnrichedSourceProvider(changefeedbase.EncodingOptions{}, enrichedSourceData{})
+	esp, err := newEnrichedSourceProvider(changefeedbase.EncodingOptions{}, enrichedSourceData{})
+	require.NoError(t, err)
 	source, err := esp.GetJSON(cdcevent.Row{})
 	require.NoError(t, err)
 
@@ -4236,7 +4238,7 @@ func TestChangefeedEnrichedSourceWithData(t *testing.T) {
 	}
 
 	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
+		testutils.RunTrueAndFalse(t, "mvcc_ts", func(t *testing.T, withMVCCTS bool) {
 			clusterName := "clusterName123"
 			dbVersion := "v999.0.0"
 			defer build.TestingOverrideVersion(dbVersion)()
@@ -4248,7 +4250,11 @@ func TestChangefeedEnrichedSourceWithData(t *testing.T) {
 
 					sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY)`)
 					sqlDB.Exec(t, `INSERT INTO foo values (0)`)
-					testFeed := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR foo WITH envelope=enriched, enriched_properties='source', format=%s`, testCase.format))
+					stmt := fmt.Sprintf(`CREATE CHANGEFEED FOR foo WITH envelope=enriched, enriched_properties='source', format=%s`, testCase.format)
+					if withMVCCTS {
+						stmt += ", mvcc_timestamp"
+					}
+					testFeed := feed(t, f, stmt)
 					defer closeFeed(t, testFeed)
 
 					var jobID int64
@@ -4276,35 +4282,50 @@ func TestChangefeedEnrichedSourceWithData(t *testing.T) {
 							sink = sinkTypeSinklessBuffer.String()
 						}
 
+						const dummyMvccTimestamp = "1234567890.0001"
+						jobIDStr := strconv.FormatInt(jobID, 10)
+
 						var assertion string
 						if testCase.format == "avro" {
-							assertion = fmt.Sprintf(
-								`{
-								"source": {
-									"cluster_id": {"string": "%s"},
-									"cluster_name": {"string": "%s"},
-									"db_version": {"string": "%s"},
-									"job_id": {"string": "%d"},
-									"node_id": {"string": "%s"},
-									"node_name": {"string": "%s"},
-									"changefeed_sink": {"string": "%s"},
-									"source_node_locality": {"string": "%s"}
-								}
-							}`,
-								clusterID, clusterName, dbVersion, jobID, nodeID, nodeName, sink, sourceNodeLocality)
+							assertionMap := map[string]any{
+								"source": map[string]any{
+									"cluster_id":   map[string]any{"string": clusterID},
+									"cluster_name": map[string]any{"string": clusterName},
+									"db_version":   map[string]any{"string": dbVersion},
+									"job_id":       map[string]any{"string": jobIDStr},
+									// Note that the field is still present in the avro schema, so it appears here as nil.
+									"mvcc_timestamp":       nil,
+									"node_id":              map[string]any{"string": nodeID},
+									"node_name":            map[string]any{"string": nodeName},
+									"changefeed_sink":      map[string]any{"string": sink},
+									"source_node_locality": map[string]any{"string": sourceNodeLocality},
+								},
+							}
+							if withMVCCTS {
+								mvccTsMap := actualSource["source"].(map[string]any)["mvcc_timestamp"].(map[string]any)
+								assertReasonableMVCCTimestamp(t, mvccTsMap["string"].(string))
+
+								mvccTsMap["string"] = dummyMvccTimestamp
+								assertionMap["source"].(map[string]any)["mvcc_timestamp"] = map[string]any{"string": dummyMvccTimestamp}
+							}
+							assertion = toJSON(t, assertionMap)
 						} else {
-							assertion = fmt.Sprintf(
-								`{
-								"cluster_id": "%s",
-								"cluster_name": "%s",
-								"db_version": "%s",
-								"job_id": "%d",
-								"node_id": "%s",
-								"node_name": "%s",
-								"changefeed_sink": "%s",
-								"source_node_locality": "%s"
-							}`,
-								clusterID, clusterName, dbVersion, jobID, nodeID, nodeName, sink, sourceNodeLocality)
+							assertionMap := map[string]any{
+								"cluster_id":           clusterID,
+								"cluster_name":         clusterName,
+								"db_version":           dbVersion,
+								"job_id":               jobIDStr,
+								"node_id":              nodeID,
+								"node_name":            nodeName,
+								"changefeed_sink":      sink,
+								"source_node_locality": sourceNodeLocality,
+							}
+							if withMVCCTS {
+								assertReasonableMVCCTimestamp(t, actualSource["mvcc_timestamp"].(string))
+								actualSource["mvcc_timestamp"] = dummyMvccTimestamp
+								assertionMap["mvcc_timestamp"] = dummyMvccTimestamp
+							}
+							assertion = toJSON(t, assertionMap)
 						}
 
 						value, err := reformatJSON(actualSource)
@@ -5734,6 +5755,30 @@ func TestChangefeedDataTTL(t *testing.T) {
 	// TODO(samiskin): Tenant test disabled because this test requires
 	// forceTableGC which doesn't work on tenants
 	cdcTestWithSystem(t, testFn, feedTestForceSink("sinkless"), feedTestNoTenants)
+}
+
+// TestChangefeedOutdatedCursor ensures that create changefeeds fail with an
+// error in the case where the cursor is older than the GC TTL of the table.
+func TestChangefeedOutdatedCursor(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE TABLE f (a INT PRIMARY KEY)`)
+		outdatedTS := s.Server.Clock().Now().AsOfSystemTime()
+		sqlDB.Exec(t, `INSERT INTO f VALUES (1)`)
+		forceTableGC(t, s.SystemServer, sqlDB, "system", "descriptor")
+		createChangefeed :=
+			fmt.Sprintf(`CREATE CHANGEFEED FOR TABLE f with cursor = '%s'`, outdatedTS)
+		expectedErrorSubstring :=
+			fmt.Sprintf(
+				"could not create changefeed: cursor %s is older than the GC threshold", outdatedTS)
+		expectErrCreatingFeed(t, f, createChangefeed, expectedErrorSubstring)
+	}
+
+	cdcTestWithSystem(t, testFn, feedTestNoTenants)
 }
 
 // TestChangefeedSchemaTTL ensures that changefeeds fail with an error in the case
@@ -10747,4 +10792,10 @@ func TestChangefeedProtectedTimestampUpdate(t *testing.T) {
 	})
 
 	cdcTest(t, testFn, feedTestForceSink("kafka"), withTxnRetries)
+}
+
+func assertReasonableMVCCTimestamp(t *testing.T, ts string) {
+	epochNanos := parseTimeToHLC(t, ts).WallTime
+	now := timeutil.Now()
+	require.GreaterOrEqual(t, epochNanos, now.Add(-1*time.Hour).UnixNano())
 }

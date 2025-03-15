@@ -59,6 +59,11 @@ func (i KVInserter) Del(key ...interface{}) {
 	// empty).
 }
 
+// DelMustAcquireExclusiveLock is not implemented.
+func (i KVInserter) DelMustAcquireExclusiveLock(key ...interface{}) {
+	// See comment within Del for why this is a no-op.
+}
+
 // Put method of the row.Putter interface.
 func (i KVInserter) Put(key, value interface{}) {
 	i(roachpb.KeyValue{
@@ -67,16 +72,29 @@ func (i KVInserter) Put(key, value interface{}) {
 	})
 }
 
-func (c KVInserter) PutMustAcquireExclusiveLock(key, value interface{}) {}
+func (c KVInserter) PutMustAcquireExclusiveLock(key, value interface{}) {
+	panic(errors.AssertionFailedf("unimplemented"))
+}
 func (c KVInserter) CPutWithOriginTimestamp(
 	key, value interface{}, expValue []byte, ts hlc.Timestamp, shouldWinTie bool,
 ) {
+	panic(errors.AssertionFailedf("unimplemented"))
 }
-func (c KVInserter) CPutBytesEmpty(kys []roachpb.Key, values [][]byte)         {}
-func (c KVInserter) CPutTuplesEmpty(kys []roachpb.Key, values [][]byte)        {}
-func (c KVInserter) CPutValuesEmpty(kys []roachpb.Key, values []roachpb.Value) {}
-func (c KVInserter) PutBytes(kys []roachpb.Key, values [][]byte)               {}
-func (c KVInserter) PutTuples(kys []roachpb.Key, values [][]byte)              {}
+func (c KVInserter) CPutBytesEmpty(kys []roachpb.Key, values [][]byte) {
+	panic(errors.AssertionFailedf("unimplemented"))
+}
+func (c KVInserter) CPutTuplesEmpty(kys []roachpb.Key, values [][]byte) {
+	panic(errors.AssertionFailedf("unimplemented"))
+}
+func (c KVInserter) CPutValuesEmpty(kys []roachpb.Key, values []roachpb.Value) {
+	panic(errors.AssertionFailedf("unimplemented"))
+}
+func (c KVInserter) PutBytes(kys []roachpb.Key, values [][]byte) {
+	panic(errors.AssertionFailedf("unimplemented"))
+}
+func (c KVInserter) PutTuples(kys []roachpb.Key, values [][]byte) {
+	panic(errors.AssertionFailedf("unimplemented"))
+}
 
 // GenerateInsertRow prepares a row tuple for insertion. It fills in default
 // expressions, verifies non-nullable columns, and checks column widths.
@@ -560,11 +578,16 @@ func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex in
 		c.EvalCtx.PopIVarContainer()
 	}
 
+	// TODO(mw5h, drewk): call into the vector index library to determine the partitions
+	// to update.
+	var vh VectorIndexUpdateHelper
+
 	if err := c.ri.InsertRow(
 		ctx,
 		c.kvInserter,
 		insertRow,
 		pm,
+		vh,
 		nil, /* OriginTimestampCPutHelper */
 		PutOp,
 		false, /* traceKV */

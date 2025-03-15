@@ -23,6 +23,11 @@ const minSplitSuggestionInterval = time.Minute
 const minNoSplitKeyLoggingMetricsInterval = time.Minute
 const minPerSecondSampleDuration = time.Second
 
+type PopularKey struct {
+	Key       roachpb.Key
+	Frequency float64
+}
+
 type LoadBasedSplitter interface {
 	redact.SafeFormatter
 	// Record informs the LoadBasedSplitter about where the span lies with regard
@@ -43,12 +48,16 @@ type LoadBasedSplitter interface {
 	// empty string.
 	NoSplitKeyCauseLogMsg() redact.RedactableString
 
-	// PopularKeyFrequency returns the percentage that the most popular key
-	// appears in the sampled candidate split keys.
-	PopularKeyFrequency() float64
+	// PopularKey returns the most popular key in the sample dataset in addition
+	// to its frequency..
+	PopularKey() PopularKey
 
 	// String formats the state of the load based splitter.
 	String() string
+
+	// AccessDirection returns a value in [-1, 1] indicating
+	// how requests are shifting over time (left/descending vs right/ascending).
+	AccessDirection() float64
 }
 
 type LoadSplitConfig interface {
@@ -262,7 +271,7 @@ func (d *Decider) recordLocked(
 				if now.Sub(d.mu.lastNoSplitKeyLoggingMetrics) > minNoSplitKeyLoggingMetricsInterval {
 					d.mu.lastNoSplitKeyLoggingMetrics = now
 					if causeMsg := d.mu.splitFinder.NoSplitKeyCauseLogMsg(); causeMsg != "" {
-						popularKeyFrequency := d.mu.splitFinder.PopularKeyFrequency()
+						popularKeyFrequency := d.mu.splitFinder.PopularKey().Frequency
 						log.KvDistribution.Infof(ctx, "%s, most popular key occurs in %d%% of samples",
 							causeMsg, int(popularKeyFrequency*100))
 						log.KvDistribution.VInfof(ctx, 3, "splitter_state=%v", (*lockedDecider)(d))

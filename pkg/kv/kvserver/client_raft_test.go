@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/storage/mvccencoding"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -837,14 +838,12 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 	}
 }
 
-func waitForTruncationForTesting(t *testing.T, r *kvserver.Replica, newFirstIndex kvpb.RaftIndex) {
+func waitForTruncationForTesting(t *testing.T, r *kvserver.Replica, compacted kvpb.RaftIndex) {
 	testutils.SucceedsSoon(t, func() error {
 		// Flush the engine to advance durability, which triggers truncation.
 		require.NoError(t, r.Store().TODOEngine().Flush())
-		// FirstIndex has changed.
-		firstIndex := r.GetFirstIndex()
-		if firstIndex != newFirstIndex {
-			return errors.Errorf("expected firstIndex == %d, got %d", newFirstIndex, firstIndex)
+		if index := r.GetCompactedIndex(); index != compacted {
+			return errors.Errorf("expected compacted index == %d, got %d", compacted, index)
 		}
 		return nil
 	})
@@ -1024,7 +1023,7 @@ func TestSnapshotAfterTruncationWithUncommittedTail(t *testing.T) {
 		}
 		return nil
 	})
-	waitForTruncationForTesting(t, newLeaderRepl, index+1)
+	waitForTruncationForTesting(t, newLeaderRepl, index)
 
 	snapsMetric := tc.GetFirstStoreFromServer(t, partStore).Metrics().RangeSnapshotsAppliedByVoters
 	snapsBefore := snapsMetric.Count()
@@ -4090,6 +4089,13 @@ func TestVoterRemovalWithoutDemotion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// This test modifies the range descriptor in the proposal filter, which is
+	// technically not allowed; see the comment in ReplicaState.Desc which talks
+	// about the RangeDescriptor needing to be immutable. As such, we're
+	// susceptible to benign test-only races, as seen in
+	// https://github.com/cockroachdb/cockroach/issues/142809.
+	skip.UnderRace(t, "modifies the range descriptor")
+
 	// Inject a filter which skips the demotion of a voter replica when removing
 	// it from the range. This will trigger the raft-level check which ensures
 	// that a voter replica cannot be removed directly.
@@ -6004,7 +6010,7 @@ func TestRaftSnapshotsWithMVCCRangeKeysEverywhere(t *testing.T) {
 					EndKey: append(prefix.Clone(), 'z'),
 				}, bounds)
 				require.Equal(t, []storage.EngineRangeKeyValue{{
-					Version: storage.EncodeMVCCTimestampSuffix(now),
+					Version: mvccencoding.EncodeMVCCTimestampSuffix(now),
 					Value:   valueLocalTSRaw,
 				}}, iter.EngineRangeKeys())
 

@@ -10,7 +10,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 )
 
@@ -28,13 +27,7 @@ var KVSlotAdjusterOverloadThreshold = settings.RegisterIntSetting(
 // cpuOverloadIndicator.
 type kvSlotAdjuster struct {
 	settings *cluster.Settings
-	// This is the slotGranter used for KVWork. In single-tenant settings, it
-	// is the only one we adjust using the periodic cpu overload signal. We
-	// don't adjust slots for SQLStatementLeafStartWork and
-	// SQLStatementRootStartWork using the periodic cpu overload signal since:
-	// - these are potentially long-lived work items and not CPU bound
-	// - we don't know how to coordinate adjustment of those slots and the KV
-	//   slots.
+	// This is the slotGranter used for KVWork.
 	granter     *slotGranter
 	minCPUSlots int
 	maxCPUSlots int
@@ -117,9 +110,5 @@ func (kvsa *kvSlotAdjuster) CPULoad(runnable int, procs int, samplePeriod time.D
 }
 
 func (kvsa *kvSlotAdjuster) isOverloaded() bool {
-	if !grunning.Supported {
-		// See https://github.com/cockroachdb/cockroach/issues/142262.
-		return false
-	}
 	return kvsa.granter.usedSlots >= kvsa.granter.totalSlots && !kvsa.granter.skipSlotEnforcement
 }

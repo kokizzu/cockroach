@@ -6,6 +6,7 @@
 package checkpoint_test
 
 import (
+	"iter"
 	"math"
 	"sort"
 	"testing"
@@ -43,6 +44,16 @@ func (rs checkpointSpans) Less(i int, j int) bool {
 
 func (rs checkpointSpans) Swap(i int, j int) {
 	rs[i], rs[j] = rs[j], rs[i]
+}
+
+func (rs checkpointSpans) All() iter.Seq2[roachpb.Span, hlc.Timestamp] {
+	return func(yield func(roachpb.Span, hlc.Timestamp) bool) {
+		for _, checkpointSpan := range rs {
+			if !yield(checkpointSpan.span, checkpointSpan.ts) {
+				return
+			}
+		}
+	}
 }
 
 func TestCheckpointMake(t *testing.T) {
@@ -136,11 +147,7 @@ func TestCheckpointMake(t *testing.T) {
 
 			actualCheckpoint := checkpoint.Make(
 				tc.frontier,
-				func(fn span.Operation) {
-					for _, sp := range tc.spans {
-						fn(sp.span, sp.ts)
-					}
-				},
+				tc.spans.All(),
 				tc.maxBytes,
 				aggMetrics.AddChild(),
 			)
@@ -231,10 +238,9 @@ func TestCheckpointRestore(t *testing.T) {
 			require.NoError(t, err)
 
 			actualFrontierSpans := checkpointSpans{}
-			actualFrontier.Entries(func(sp roachpb.Span, ts hlc.Timestamp) span.OpResult {
+			for sp, ts := range actualFrontier.Entries() {
 				actualFrontierSpans = append(actualFrontierSpans, checkpointSpan{span: sp, ts: ts})
-				return span.ContinueMatch
-			})
+			}
 
 			expectedFrontierSpans := checkpointSpans{}
 			expectedFrontier, err := span.MakeFrontierAt(tc.initialHighWater, tc.trackedSpans...)
@@ -243,10 +249,9 @@ func TestCheckpointRestore(t *testing.T) {
 				_, err = expectedFrontier.Forward(s.span, s.ts)
 				require.NoError(t, err)
 			}
-			expectedFrontier.Entries(func(sp roachpb.Span, ts hlc.Timestamp) span.OpResult {
+			for sp, ts := range expectedFrontier.Entries() {
 				expectedFrontierSpans = append(expectedFrontierSpans, checkpointSpan{span: sp, ts: ts})
-				return span.ContinueMatch
-			})
+			}
 			require.Equal(t, expectedFrontierSpans, actualFrontierSpans)
 		})
 	}
@@ -301,11 +306,7 @@ func TestCheckpointMakeRestoreRoundTrip(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cp := checkpoint.Make(
 				tc.frontier,
-				func(fn span.Operation) {
-					for _, sp := range tc.spans {
-						fn(sp.span, sp.ts)
-					}
-				},
+				tc.spans.All(),
 				changefeedbase.SpanCheckpointMaxBytes.Default(),
 				nil, /* metrics */
 			)
@@ -315,10 +316,9 @@ func TestCheckpointMakeRestoreRoundTrip(t *testing.T) {
 				restoredFrontier, err := span.MakeFrontierAt(tc.frontier, tc.trackedSpans...)
 				require.NoError(t, err)
 				require.NoError(t, checkpoint.Restore(restoredFrontier, cp))
-				restoredFrontier.Entries(func(sp roachpb.Span, ts hlc.Timestamp) (done span.OpResult) {
+				for sp, ts := range restoredFrontier.Entries() {
 					spans = append(spans, checkpointSpan{span: sp, ts: ts})
-					return span.ContinueMatch
-				})
+				}
 				return spans
 			}()
 
@@ -493,14 +493,8 @@ func TestLegacyCheckpointCatchupTime(t *testing.T) {
 	}
 	shuffle.Shuffle(spans)
 
-	forEachSpan := func(fn span.Operation) {
-		for _, s := range spans {
-			fn(s.span, s.ts)
-		}
-	}
-
 	// Compute the checkpoint.
-	cp := checkpoint.ConvertToLegacyCheckpoint(checkpoint.Make(hwm, forEachSpan, maxBytes, nil /* metrics */))
+	cp := checkpoint.ConvertToLegacyCheckpoint(checkpoint.Make(hwm, spans.All(), maxBytes, nil /* metrics */))
 	cpSpans, cpTS := roachpb.Spans(cp.Spans), cp.Timestamp
 	require.Less(t, len(cpSpans), numSpans)
 	require.True(t, hwm.Less(cpTS))

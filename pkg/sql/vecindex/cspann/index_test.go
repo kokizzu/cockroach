@@ -54,6 +54,8 @@ func TestIndex(t *testing.T) {
 			// Skip files that are not data-driven tests.
 			return
 		}
+		state.Reset()
+
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "new-index":
@@ -77,7 +79,7 @@ func TestIndex(t *testing.T) {
 			case "delete":
 				return state.Delete(d)
 
-			case "force-split", "force-merge":
+			case "force-split-or-merge":
 				return state.ForceSplitOrMerge(d)
 
 			case "recall":
@@ -85,6 +87,9 @@ func TestIndex(t *testing.T) {
 
 			case "validate-tree":
 				return state.ValidateTree(d)
+
+			case "metrics":
+				return state.ShowMetrics(d)
 			}
 
 			t.Fatalf("unknown cmd: %s", d.Cmd)
@@ -103,6 +108,11 @@ type testState struct {
 	Index      *cspann.Index
 	Options    cspann.IndexOptions
 	Features   vector.Set
+
+	// Metrics
+	SuccessfulSplits int
+	FixupsAdded      int
+	FixupsProcessed  int
 }
 
 func (s *testState) NewIndex(d *datadriven.TestData) string {
@@ -133,12 +143,23 @@ func (s *testState) NewIndex(d *datadriven.TestData) string {
 	s.Index, err = cspann.NewIndex(s.Ctx, s.InMemStore, s.Quantizer, 42, &s.Options, s.Stopper)
 	require.NoError(s.T, err)
 
+	s.Index.Fixups().OnSuccessfulSplit(func() { s.SuccessfulSplits++ })
+	s.Index.Fixups().OnFixupAdded(func() { s.FixupsAdded++ })
+	s.Index.Fixups().OnFixupProcessed(func() { s.FixupsProcessed++ })
+
 	// Suspend background fixups until ProcessFixups is explicitly called, so
 	// that vector index operations can be deterministic.
 	s.Index.SuspendFixups()
 
 	// Insert initial vectors.
 	return s.Insert(d)
+}
+
+func (s *testState) Reset() {
+	// Reset state between tests.
+	s.SuccessfulSplits = 0
+	s.FixupsAdded = 0
+	s.FixupsProcessed = 0
 }
 
 func (s *testState) FormatTree(d *datadriven.TestData) string {
@@ -454,10 +475,8 @@ func (s *testState) ForceSplitOrMerge(d *datadriven.TestData) string {
 		}
 	}
 
-	if d.Cmd == "force-split" {
-		s.Index.ForceSplit(s.Ctx, treeKey, parentPartitionKey, partitionKey)
-	} else {
-		s.Index.ForceMerge(s.Ctx, treeKey, parentPartitionKey, partitionKey)
+	if d.Cmd == "force-split-or-merge" {
+		s.Index.ForceSplitOrMerge(s.Ctx, treeKey, parentPartitionKey, partitionKey)
 	}
 
 	// Ensure the fixup runs.
@@ -633,6 +652,14 @@ func (s *testState) ValidateTree(d *datadriven.TestData) string {
 	}
 
 	return fmt.Sprintf("Validated index with %d vectors.\n", vectorCount)
+}
+
+func (s *testState) ShowMetrics(d *datadriven.TestData) string {
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("%d successful splits\n", s.SuccessfulSplits))
+	buf.WriteString(fmt.Sprintf("%d fixups added to queue\n", s.FixupsAdded))
+	buf.WriteString(fmt.Sprintf("%d fixups processed\n", s.FixupsProcessed))
+	return buf.String()
 }
 
 func (s *testState) parseInt(arg datadriven.CmdArg) int {

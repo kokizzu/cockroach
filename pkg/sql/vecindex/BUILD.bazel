@@ -4,6 +4,7 @@ go_library(
     name = "vecindex",
     srcs = [
         "manager.go",
+        "metrics.go",
         "mutation_searcher.go",
         "searcher.go",
         "testing_knobs.go",
@@ -23,7 +24,9 @@ go_library(
         "//pkg/sql/vecindex/cspann/quantize",
         "//pkg/sql/vecindex/vecpb",
         "//pkg/sql/vecindex/vecstore",
+        "//pkg/util/buildutil",
         "//pkg/util/log",
+        "//pkg/util/metric",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/vector",
@@ -36,8 +39,9 @@ go_test(
     srcs = [
         "manager_test.go",
         "searcher_test.go",
+        "vecindex_test.go",
     ],
-    data = glob(["testdata/**"]),
+    data = ["//pkg/sql/vecindex/cspann:features_10000"],
     embed = [":vecindex"],
     deps = [
         "//pkg/base",
@@ -60,6 +64,7 @@ go_test(
         "//pkg/sql/types",
         "//pkg/sql/vecindex/cspann",
         "//pkg/sql/vecindex/cspann/quantize",
+        "//pkg/sql/vecindex/cspann/testutils",
         "//pkg/sql/vecindex/vecpb",
         "//pkg/sql/vecindex/vecstore",
         "//pkg/testutils/serverutils",

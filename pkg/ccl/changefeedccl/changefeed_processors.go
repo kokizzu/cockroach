@@ -8,7 +8,9 @@ package changefeedccl
 import (
 	"context"
 	"fmt"
+	"iter"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
 
@@ -608,7 +610,7 @@ func (ca *changeAggregator) setupSpansAndFrontier() (spans []roachpb.Span, err e
 	// can ignore it from this point on.
 	if !ca.spec.Checkpoint.IsEmpty() {
 		if ca.spec.SpanLevelCheckpoint != nil {
-			return nil, errors.New("both legacy and current checkpoint set on change aggregator spec")
+			return nil, errors.AssertionFailedf("both legacy and current checkpoint set on change aggregator spec")
 		}
 
 		// This conversion undoes an unnecessary conversion when the spec
@@ -797,14 +799,13 @@ func (ca *changeAggregator) computeTrailingMetadata(meta *execinfrapb.Changefeed
 	}
 
 	// Build out the list of frontier spans.
-	ca.frontier.Entries(func(r roachpb.Span, ts hlc.Timestamp) (done span.OpResult) {
+	for sp, ts := range ca.frontier.Entries() {
 		meta.Checkpoint = append(meta.Checkpoint,
 			execinfrapb.ChangefeedMeta_FrontierSpan{
-				Span:      r,
+				Span:      sp,
 				Timestamp: ts,
 			})
-		return span.ContinueMatch
-	})
+	}
 }
 
 // tick is the workhorse behind Next(). It retrieves the next event from
@@ -929,15 +930,9 @@ func (ca *changeAggregator) flushFrontier() error {
 	}
 
 	// Iterate frontier spans and build a list of spans to emit.
-	var batch jobspb.ResolvedSpans
-	ca.frontier.EntriesWithBoundaryType(func(s roachpb.Span, ts hlc.Timestamp, boundaryType jobspb.ResolvedSpan_BoundaryType) (done span.OpResult) {
-		batch.ResolvedSpans = append(batch.ResolvedSpans, jobspb.ResolvedSpan{
-			Span:         s,
-			Timestamp:    ts,
-			BoundaryType: boundaryType,
-		})
-		return span.ContinueMatch
-	})
+	batch := jobspb.ResolvedSpans{
+		ResolvedSpans: slices.Collect(ca.frontier.All()),
+	}
 	return ca.emitResolved(batch)
 }
 
@@ -1105,6 +1100,18 @@ func (cs *cachedState) SetCheckpoint(checkpoint *jobspb.TimestampSpansMap) {
 	cs.progress.Details.(*jobspb.Progress_Changefeed).Changefeed.SpanLevelCheckpoint = checkpoint
 }
 
+// AggregatorFrontierSpans returns an iterator over the spans in the aggregator
+// frontier collected during shutdown.
+func (cs *cachedState) AggregatorFrontierSpans() iter.Seq2[roachpb.Span, hlc.Timestamp] {
+	return func(yield func(roachpb.Span, hlc.Timestamp) bool) {
+		for _, entry := range cs.aggregatorFrontier {
+			if !yield(entry.Span, entry.Timestamp) {
+				return
+			}
+		}
+	}
+}
+
 func newJobState(
 	j *jobs.Job, st *cluster.Settings, metrics *Metrics, ts timeutil.TimeSource,
 ) *jobState {
@@ -1250,7 +1257,10 @@ func newChangeFrontierProcessor(
 
 	// This changeFrontier's encoder will only be used for resolved events which
 	// never have a source field, so we pass an empty enriched source provider.
-	sourceProvider := newEnrichedSourceProvider(encodingOpts, enrichedSourceData{})
+	sourceProvider, err := newEnrichedSourceProvider(encodingOpts, enrichedSourceData{})
+	if err != nil {
+		return nil, err
+	}
 	if cf.encoder, err = getEncoder(
 		ctx, encodingOpts, AllTargets(spec.Feed), spec.Feed.Select != "",
 		makeExternalConnectionProvider(ctx, flowCtx.Cfg.DB), sliMetrics,
